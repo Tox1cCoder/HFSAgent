@@ -1,364 +1,817 @@
 import os
-import re
 from dotenv import load_dotenv
+from typing import List, Dict, Any, Optional
+import tempfile
+import re
+import json
+import requests
+from urllib.parse import urlparse
+import pytesseract
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+import cmath
+import pandas as pd
+import uuid
+import numpy as np
+from code_interpreter import CodeInterpreter
+
+interpreter_instance = CodeInterpreter()
+
+from image_processing import *
+
+"""Langraph"""
 from langgraph.graph import START, StateGraph, MessagesState
-from langgraph.prebuilt import tools_condition
-from langgraph.prebuilt import ToolNode
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_community.document_loaders import WikipediaLoader
+from langchain_community.document_loaders import ArxivLoader
+from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
+from langchain_huggingface import (
+    ChatHuggingFace,
+    HuggingFaceEndpoint,
+    HuggingFaceEmbeddings,
+)
+from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain.tools.retriever import create_retriever_tool
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.document_loaders import WikipediaLoader
-from langchain_community.document_loaders import ArxivLoader
-from langchain_community.vectorstores import SupabaseVectorStore
 from supabase.client import Client, create_client
-import numpy as np
 
-# Load environment variables
 load_dotenv()
 
-
-# Math Tools
-@tool
-def multiply(a: int, b: int) -> int:
-    """Multiply two numbers.
-    Args:
-        a: first int
-        b: second int
-    """
-    return a * b
-
-
-@tool
-def add(a: int, b: int) -> int:
-    """Add two numbers.
-    Args:
-        a: first int
-        b: second int
-    """
-    return a + b
-
-
-@tool
-def subtract(a: int, b: int) -> int:
-    """Subtract two numbers.
-    Args:
-        a: first int
-        b: second int
-    """
-    return a - b
-
-
-@tool
-def divide(a: int, b: int) -> float:
-    """Divide two numbers.
-    Args:
-        a: first int
-        b: second int
-    """
-    if b == 0:
-        raise ValueError("Cannot divide by zero.")
-    return a / b
-
-
-@tool
-def modulus(a: int, b: int) -> int:
-    """Get the modulus of two numbers.
-    Args:
-        a: first int
-        b: second int
-    """
-    return a % b
-
-
-@tool
-def calculate(expression: str) -> str:
-    """Calculate a mathematical expression safely.
-    Args:
-        expression: A string representing a mathematical expression
-    """
-    try:
-        # Define allowed operators and functions
-        allowed_operators = {
-            "add": np.add,
-            "subtract": np.subtract,
-            "multiply": np.multiply,
-            "divide": np.divide,
-            "mod": np.mod,
-            "abs": np.abs,
-            "round": np.round,
-            "sin": np.sin,
-            "cos": np.cos,
-            "tan": np.tan,
-            "exp": np.exp,
-            "log": np.log,
-            "sqrt": np.sqrt,
-            "power": np.power,
-        }
-
-        # Basic security check
-        for func_name in allowed_operators.keys():
-            if func_name in expression:
-                # Replace function name with numpy function call
-                expression = expression.replace(
-                    func_name, f"allowed_operators['{func_name}']"
-                )
-
-        # For safety, use eval with limited namespace
-        namespace = {
-            "__builtins__": {},
-            "allowed_operators": allowed_operators,
-            "np": np,
-        }
-        result = eval(expression, namespace)
-        return str(result)
-    except Exception as e:
-        return f"Error calculating: {str(e)}"
-
-
-@tool
-def reverse_text(text: str) -> str:
-    """Reverse a string of text.
-    Args:
-        text: The text to reverse
-    """
-    return text[::-1]
-
-
-@tool
-def extract_table_data(table_text: str) -> dict:
-    """Extract data from a markdown table.
-    Args:
-        table_text: The markdown table text
-    """
-    try:
-        # Split into lines and filter empty lines
-        lines = [line.strip() for line in table_text.split("\n") if line.strip()]
-
-        # Extract headers (first line)
-        headers = [cell.strip() for cell in lines[0].split("|") if cell.strip()]
-
-        # Skip separator line
-        data_lines = [line for line in lines[2:]]
-
-        # Extract data rows
-        rows = []
-        for line in data_lines:
-            cells = [cell.strip() for cell in line.split("|") if cell.strip()]
-            rows.append(cells)
-
-        return {"headers": headers, "rows": rows}
-    except Exception as e:
-        return {"error": f"Error extracting table data: {str(e)}"}
-
-
-@tool
-def check_commutativity(table_data: dict) -> str:
-    """Check if an operation is commutative based on its table representation.
-    Args:
-        table_data: A dictionary containing headers and rows of the table
-    """
-    try:
-        headers = table_data.get("headers", [])
-        rows = table_data.get("rows", [])
-
-        # First element in headers is usually the operation symbol, rest are elements
-        elements = headers[1:]
-
-        # Create operation mapping
-        operation_map = {}
-        for row in rows:
-            row_element = row[0]
-            for i, col_element in enumerate(elements):
-                if i + 1 < len(row):
-                    operation_map[(row_element, col_element)] = row[i + 1]
-
-        # Check commutativity
-        non_commutative_elements = set()
-        for a in elements:
-            for b in elements:
-                if a != b:
-                    a_op_b = operation_map.get((a, b))
-                    b_op_a = operation_map.get((b, a))
-                    if a_op_b != b_op_a:
-                        non_commutative_elements.add(a)
-                        non_commutative_elements.add(b)
-
-        # Format the result as comma-separated list
-        result = sorted(list(non_commutative_elements))
-        return ", ".join(result)
-    except Exception as e:
-        return f"Error checking commutativity: {str(e)}"
+### =============== BROWSER TOOLS =============== ###
 
 
 @tool
 def wiki_search(query: str) -> str:
     """Search Wikipedia for a query and return maximum 2 results.
     Args:
-        query: The search query
-    """
-    try:
-        search_docs = WikipediaLoader(query=query, load_max_docs=2).load()
-        formatted_search_docs = "\n\n---\n\n".join(
-            [
-                f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content}\n</Document>'
-                for doc in search_docs
-            ]
-        )
-        return {"wiki_results": formatted_search_docs}
-    except Exception as e:
-        return {"error": f"Error searching Wikipedia: {str(e)}"}
+        query: The search query."""
+    search_docs = WikipediaLoader(query=query, load_max_docs=2).load()
+    formatted_search_docs = "\n\n---\n\n".join(
+        [
+            f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content}\n</Document>'
+            for doc in search_docs
+        ]
+    )
+    return {"wiki_results": formatted_search_docs}
 
 
 @tool
-def arvix_search(query: str) -> str:
-    """Search Arxiv for a query and return maximum 3 results.
+def web_search(query: str) -> str:
+    """Search Tavily for a query and return maximum 3 results.
     Args:
-        query: The search query
+        query: The search query."""
+    search_docs = TavilySearchResults(max_results=3).invoke(query=query)
+    formatted_search_docs = "\n\n---\n\n".join(
+        [
+            f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content}\n</Document>'
+            for doc in search_docs
+        ]
+    )
+    return {"web_results": formatted_search_docs}
+
+
+@tool
+def arxiv_search(query: str) -> str:
+    """Search Arxiv for a query and return maximum 3 result.
+    Args:
+        query: The search query."""
+    search_docs = ArxivLoader(query=query, load_max_docs=3).load()
+    formatted_search_docs = "\n\n---\n\n".join(
+        [
+            f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content[:1000]}\n</Document>'
+            for doc in search_docs
+        ]
+    )
+    return {"arxiv_results": formatted_search_docs}
+
+
+### =============== CODE INTERPRETER TOOLS =============== ###
+
+
+@tool
+def execute_code_multilang(code: str, language: str = "python") -> str:
+    """Execute code in multiple languages (Python, Bash, SQL, C, Java) and return results.
+    Args:
+        code (str): The source code to execute.
+        language (str): The language of the code. Supported: "python", "bash", "sql", "c", "java".
+    Returns:
+        A string summarizing the execution results (stdout, stderr, errors, plots, dataframes if any).
+    """
+    supported_languages = ["python", "bash", "sql", "c", "java"]
+    language = language.lower()
+
+    if language not in supported_languages:
+        return f"❌ Unsupported language: {language}. Supported languages are: {', '.join(supported_languages)}"
+
+    result = interpreter_instance.execute_code(code, language=language)
+
+    response = []
+
+    if result["status"] == "success":
+        response.append(f"✅ Code executed successfully in **{language.upper()}**")
+
+        if result.get("stdout"):
+            response.append(
+                "\n**Standard Output:**\n```\n" + result["stdout"].strip() + "\n```"
+            )
+
+        if result.get("stderr"):
+            response.append(
+                "\n**Standard Error (if any):**\n```\n"
+                + result["stderr"].strip()
+                + "\n```"
+            )
+
+        if result.get("result") is not None:
+            response.append(
+                "\n**Execution Result:**\n```\n"
+                + str(result["result"]).strip()
+                + "\n```"
+            )
+
+        if result.get("dataframes"):
+            for df_info in result["dataframes"]:
+                response.append(
+                    f"\n**DataFrame `{df_info['name']}` (Shape: {df_info['shape']})**"
+                )
+                df_preview = pd.DataFrame(df_info["head"])
+                response.append("First 5 rows:\n```\n" + str(df_preview) + "\n```")
+
+        if result.get("plots"):
+            response.append(
+                f"\n**Generated {len(result['plots'])} plot(s)** (Image data returned separately)"
+            )
+
+    else:
+        response.append(f"❌ Code execution failed in **{language.upper()}**")
+        if result.get("stderr"):
+            response.append(
+                "\n**Error Log:**\n```\n" + result["stderr"].strip() + "\n```"
+            )
+
+    return "\n".join(response)
+
+
+### =============== MATHEMATICAL TOOLS =============== ###
+
+
+@tool
+def multiply(a: float, b: float) -> float:
+    """
+    Multiplies two numbers.
+    Args:
+        a (float): the first number
+        b (float): the second number
+    """
+    return a * b
+
+
+@tool
+def add(a: float, b: float) -> float:
+    """
+    Adds two numbers.
+    Args:
+        a (float): the first number
+        b (float): the second number
+    """
+    return a + b
+
+
+@tool
+def subtract(a: float, b: float) -> int:
+    """
+    Subtracts two numbers.
+    Args:
+        a (float): the first number
+        b (float): the second number
+    """
+    return a - b
+
+
+@tool
+def divide(a: float, b: float) -> float:
+    """
+    Divides two numbers.
+    Args:
+        a (float): the first float number
+        b (float): the second float number
+    """
+    if b == 0:
+        raise ValueError("Cannot divided by zero.")
+    return a / b
+
+
+@tool
+def modulus(a: int, b: int) -> int:
+    """
+    Get the modulus of two numbers.
+    Args:
+        a (int): the first number
+        b (int): the second number
+    """
+    return a % b
+
+
+@tool
+def power(a: float, b: float) -> float:
+    """
+    Get the power of two numbers.
+    Args:
+        a (float): the first number
+        b (float): the second number
+    """
+    return a**b
+
+
+@tool
+def square_root(a: float) -> float | complex:
+    """
+    Get the square root of a number.
+    Args:
+        a (float): the number to get the square root of
+    """
+    if a >= 0:
+        return a**0.5
+    return cmath.sqrt(a)
+
+
+### =============== DOCUMENT PROCESSING TOOLS =============== ###
+
+
+@tool
+def save_and_read_file(content: str, filename: Optional[str] = None) -> str:
+    """
+    Save content to a file and return the path.
+    Args:
+        content (str): the content to save to the file
+        filename (str, optional): the name of the file. If not provided, a random name file will be created.
+    """
+    temp_dir = tempfile.gettempdir()
+    if filename is None:
+        temp_file = tempfile.NamedTemporaryFile(delete=False, dir=temp_dir)
+        filepath = temp_file.name
+    else:
+        filepath = os.path.join(temp_dir, filename)
+
+    with open(filepath, "w") as f:
+        f.write(content)
+
+    return f"File saved to {filepath}. You can read this file to process its contents."
+
+
+@tool
+def download_file_from_url(url: str, filename: Optional[str] = None) -> str:
+    """
+    Download a file from a URL and save it to a temporary location.
+    Args:
+        url (str): the URL of the file to download.
+        filename (str, optional): the name of the file. If not provided, a random name file will be created.
     """
     try:
-        search_docs = ArxivLoader(query=query, load_max_docs=3).load()
-        formatted_search_docs = "\n\n---\n\n".join(
-            [
-                f'<Document source="{doc.metadata["source"]}" page="{doc.metadata.get("page", "")}"/>\n{doc.page_content[:1000]}\n</Document>'
-                for doc in search_docs
-            ]
-        )
-        return {"arvix_results": formatted_search_docs}
+        # Parse URL to get filename if not provided
+        if not filename:
+            path = urlparse(url).path
+            filename = os.path.basename(path)
+            if not filename:
+                filename = f"downloaded_{uuid.uuid4().hex[:8]}"
+
+        # Create temporary file
+        temp_dir = tempfile.gettempdir()
+        filepath = os.path.join(temp_dir, filename)
+
+        # Download the file
+        response = requests.get(url, stream=True)
+        response.raise_for_status()
+
+        # Save the file
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        return f"File downloaded to {filepath}. You can read this file to process its contents."
     except Exception as e:
-        return {"error": f"Error searching Arxiv: {str(e)}"}
+        return f"Error downloading file: {str(e)}"
 
 
-# Define all tools
+@tool
+def extract_text_from_image(image_path: str) -> str:
+    """
+    Extract text from an image using OCR library pytesseract (if available).
+    Args:
+        image_path (str): the path to the image file.
+    """
+    try:
+        # Open the image
+        image = Image.open(image_path)
+
+        # Extract text from the image
+        text = pytesseract.image_to_string(image)
+
+        return f"Extracted text from image:\n\n{text}"
+    except Exception as e:
+        return f"Error extracting text from image: {str(e)}"
+
+
+@tool
+def analyze_csv_file(file_path: str, query: str) -> str:
+    """
+    Analyze a CSV file using pandas and answer a question about it.
+    Args:
+        file_path (str): the path to the CSV file.
+        query (str): Question about the data
+    """
+    try:
+        # Read the CSV file
+        df = pd.read_csv(file_path)
+
+        # Run various analyses based on the query
+        result = f"CSV file loaded with {len(df)} rows and {len(df.columns)} columns.\n"
+        result += f"Columns: {', '.join(df.columns)}\n\n"
+
+        # Add summary statistics
+        result += "Summary statistics:\n"
+        result += str(df.describe())
+
+        return result
+
+    except Exception as e:
+        return f"Error analyzing CSV file: {str(e)}"
+
+
+@tool
+def analyze_excel_file(file_path: str, query: str) -> str:
+    """
+    Analyze an Excel file using pandas and answer a question about it.
+    Args:
+        file_path (str): the path to the Excel file.
+        query (str): Question about the data
+    """
+    try:
+        # Read the Excel file
+        df = pd.read_excel(file_path)
+
+        # Run various analyses based on the query
+        result = (
+            f"Excel file loaded with {len(df)} rows and {len(df.columns)} columns.\n"
+        )
+        result += f"Columns: {', '.join(df.columns)}\n\n"
+
+        # Add summary statistics
+        result += "Summary statistics:\n"
+        result += str(df.describe())
+
+        return result
+
+    except Exception as e:
+        return f"Error analyzing Excel file: {str(e)}"
+
+
+### ============== IMAGE PROCESSING AND GENERATION TOOLS =============== ###
+
+
+@tool
+def analyze_image(image_base64: str) -> Dict[str, Any]:
+    """
+    Analyze basic properties of an image (size, mode, color analysis, thumbnail preview).
+    Args:
+        image_base64 (str): Base64 encoded image string
+    Returns:
+        Dictionary with analysis result
+    """
+    try:
+        img = decode_image(image_base64)
+        width, height = img.size
+        mode = img.mode
+
+        if mode in ("RGB", "RGBA"):
+            arr = np.array(img)
+            avg_colors = arr.mean(axis=(0, 1))
+            dominant = ["Red", "Green", "Blue"][np.argmax(avg_colors[:3])]
+            brightness = avg_colors.mean()
+            color_analysis = {
+                "average_rgb": avg_colors.tolist(),
+                "brightness": brightness,
+                "dominant_color": dominant,
+            }
+        else:
+            color_analysis = {"note": f"No color analysis for mode {mode}"}
+
+        thumbnail = img.copy()
+        thumbnail.thumbnail((100, 100))
+        thumb_path = save_image(thumbnail, "thumbnails")
+        thumbnail_base64 = encode_image(thumb_path)
+
+        return {
+            "dimensions": (width, height),
+            "mode": mode,
+            "color_analysis": color_analysis,
+            "thumbnail": thumbnail_base64,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+def transform_image(
+    image_base64: str, operation: str, params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Apply transformations: resize, rotate, crop, flip, brightness, contrast, blur, sharpen, grayscale.
+    Args:
+        image_base64 (str): Base64 encoded input image
+        operation (str): Transformation operation
+        params (Dict[str, Any], optional): Parameters for the operation
+    Returns:
+        Dictionary with transformed image (base64)
+    """
+    try:
+        img = decode_image(image_base64)
+        params = params or {}
+
+        if operation == "resize":
+            img = img.resize(
+                (
+                    params.get("width", img.width // 2),
+                    params.get("height", img.height // 2),
+                )
+            )
+        elif operation == "rotate":
+            img = img.rotate(params.get("angle", 90), expand=True)
+        elif operation == "crop":
+            img = img.crop(
+                (
+                    params.get("left", 0),
+                    params.get("top", 0),
+                    params.get("right", img.width),
+                    params.get("bottom", img.height),
+                )
+            )
+        elif operation == "flip":
+            if params.get("direction", "horizontal") == "horizontal":
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+            else:
+                img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        elif operation == "adjust_brightness":
+            img = ImageEnhance.Brightness(img).enhance(params.get("factor", 1.5))
+        elif operation == "adjust_contrast":
+            img = ImageEnhance.Contrast(img).enhance(params.get("factor", 1.5))
+        elif operation == "blur":
+            img = img.filter(ImageFilter.GaussianBlur(params.get("radius", 2)))
+        elif operation == "sharpen":
+            img = img.filter(ImageFilter.SHARPEN)
+        elif operation == "grayscale":
+            img = img.convert("L")
+        else:
+            return {"error": f"Unknown operation: {operation}"}
+
+        result_path = save_image(img)
+        result_base64 = encode_image(result_path)
+        return {"transformed_image": result_base64}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+def draw_on_image(
+    image_base64: str, drawing_type: str, params: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Draw shapes (rectangle, circle, line) or text onto an image.
+    Args:
+        image_base64 (str): Base64 encoded input image
+        drawing_type (str): Drawing type
+        params (Dict[str, Any]): Drawing parameters
+    Returns:
+        Dictionary with result image (base64)
+    """
+    try:
+        img = decode_image(image_base64)
+        draw = ImageDraw.Draw(img)
+        color = params.get("color", "red")
+
+        if drawing_type == "rectangle":
+            draw.rectangle(
+                [params["left"], params["top"], params["right"], params["bottom"]],
+                outline=color,
+                width=params.get("width", 2),
+            )
+        elif drawing_type == "circle":
+            x, y, r = params["x"], params["y"], params["radius"]
+            draw.ellipse(
+                (x - r, y - r, x + r, y + r),
+                outline=color,
+                width=params.get("width", 2),
+            )
+        elif drawing_type == "line":
+            draw.line(
+                (
+                    params["start_x"],
+                    params["start_y"],
+                    params["end_x"],
+                    params["end_y"],
+                ),
+                fill=color,
+                width=params.get("width", 2),
+            )
+        elif drawing_type == "text":
+            font_size = params.get("font_size", 20)
+            try:
+                font = ImageFont.truetype("arial.ttf", font_size)
+            except IOError:
+                font = ImageFont.load_default()
+            draw.text(
+                (params["x"], params["y"]),
+                params.get("text", "Text"),
+                fill=color,
+                font=font,
+            )
+        else:
+            return {"error": f"Unknown drawing type: {drawing_type}"}
+
+        result_path = save_image(img)
+        result_base64 = encode_image(result_path)
+        return {"result_image": result_base64}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+def generate_simple_image(
+    image_type: str,
+    width: int = 500,
+    height: int = 500,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Generate a simple image (gradient, noise, pattern, chart).
+    Args:
+        image_type (str): Type of image
+        width (int), height (int)
+        params (Dict[str, Any], optional): Specific parameters
+    Returns:
+        Dictionary with generated image (base64)
+    """
+    try:
+        params = params or {}
+
+        if image_type == "gradient":
+            direction = params.get("direction", "horizontal")
+            start_color = params.get("start_color", (255, 0, 0))
+            end_color = params.get("end_color", (0, 0, 255))
+
+            img = Image.new("RGB", (width, height))
+            draw = ImageDraw.Draw(img)
+
+            if direction == "horizontal":
+                for x in range(width):
+                    r = int(
+                        start_color[0] + (end_color[0] - start_color[0]) * x / width
+                    )
+                    g = int(
+                        start_color[1] + (end_color[1] - start_color[1]) * x / width
+                    )
+                    b = int(
+                        start_color[2] + (end_color[2] - start_color[2]) * x / width
+                    )
+                    draw.line([(x, 0), (x, height)], fill=(r, g, b))
+            else:
+                for y in range(height):
+                    r = int(
+                        start_color[0] + (end_color[0] - start_color[0]) * y / height
+                    )
+                    g = int(
+                        start_color[1] + (end_color[1] - start_color[1]) * y / height
+                    )
+                    b = int(
+                        start_color[2] + (end_color[2] - start_color[2]) * y / height
+                    )
+                    draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+        elif image_type == "noise":
+            noise_array = np.random.randint(0, 256, (height, width, 3), dtype=np.uint8)
+            img = Image.fromarray(noise_array, "RGB")
+
+        else:
+            return {"error": f"Unsupported image_type {image_type}"}
+
+        result_path = save_image(img)
+        result_base64 = encode_image(result_path)
+        return {"generated_image": result_base64}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+def combine_images(
+    images_base64: List[str], operation: str, params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """
+    Combine multiple images (collage, stack, blend).
+    Args:
+        images_base64 (List[str]): List of base64 images
+        operation (str): Combination type
+        params (Dict[str, Any], optional)
+    Returns:
+        Dictionary with combined image (base64)
+    """
+    try:
+        images = [decode_image(b64) for b64 in images_base64]
+        params = params or {}
+
+        if operation == "stack":
+            direction = params.get("direction", "horizontal")
+            if direction == "horizontal":
+                total_width = sum(img.width for img in images)
+                max_height = max(img.height for img in images)
+                new_img = Image.new("RGB", (total_width, max_height))
+                x = 0
+                for img in images:
+                    new_img.paste(img, (x, 0))
+                    x += img.width
+            else:
+                max_width = max(img.width for img in images)
+                total_height = sum(img.height for img in images)
+                new_img = Image.new("RGB", (max_width, total_height))
+                y = 0
+                for img in images:
+                    new_img.paste(img, (0, y))
+                    y += img.height
+        else:
+            return {"error": f"Unsupported combination operation {operation}"}
+
+        result_path = save_image(new_img)
+        result_base64 = encode_image(result_path)
+        return {"combined_image": result_base64}
+
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# load the system prompt from the file
+with open("system_prompt.txt", "r", encoding="utf-8") as f:
+    system_prompt = f.read()
+
+# System message
+sys_msg = SystemMessage(content=system_prompt)
+
+# build a retriever
+embeddings = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-base-en-v1.5", encode_kwargs={"normalize_embeddings": True}
+)  #  dim=768
+supabase: Client = create_client(
+    os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+)
+vector_store = SupabaseVectorStore(
+    client=supabase,
+    embedding=embeddings,
+    table_name="documents",
+    query_name="match_documents",
+)
+create_retriever_tool = create_retriever_tool(
+    retriever=vector_store.as_retriever(),
+    name="Question Search",
+    description="A tool to retrieve similar questions from a vector store.",
+)
+
+
 tools = [
+    web_search,
+    wiki_search,
+    arxiv_search,
     multiply,
     add,
     subtract,
     divide,
     modulus,
-    calculate,
-    reverse_text,
-    extract_table_data,
-    check_commutativity,
-    wiki_search,
-    arvix_search,
+    power,
+    square_root,
+    save_and_read_file,
+    download_file_from_url,
+    extract_text_from_image,
+    analyze_csv_file,
+    analyze_excel_file,
+    execute_code_multilang,
+    analyze_image,
+    transform_image,
+    draw_on_image,
+    generate_simple_image,
+    combine_images,
 ]
-
-# Retriever setup (conditionally execute if Supabase credentials are available)
-try:
-    # Initialize vector store if environment variables are set
-    if os.environ.get("SUPABASE_URL") and os.environ.get("SUPABASE_SERVICE_KEY"):
-        # Set up embeddings model
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-mpnet-base-v2"
-        )
-        # Connect to Supabase
-        supabase_client = create_client(
-            os.environ.get("SUPABASE_URL"), os.environ.get("SUPABASE_SERVICE_KEY")
-        )
-        # Create vector store
-        vector_store = SupabaseVectorStore(
-            client=supabase_client,
-            embedding=embeddings,
-            table_name="documents",
-            query_name="match_documents_langchain",
-        )
-        # Create retriever tool
-        retriever_tool = create_retriever_tool(
-            retriever=vector_store.as_retriever(),
-            name="question_search",
-            description="Search for similar questions and answers in the database",
-        )
-        # Add retriever to tools list
-        tools.append(retriever_tool)
-        has_vector_store = True
-    else:
-        has_vector_store = False
-        print(
-            "Supabase credentials not found. Proceeding without retrieval capabilities."
-        )
-except Exception as e:
-    has_vector_store = False
-    print(f"Error setting up vector store: {e}")
-
-# Read system prompt
-with open("system_prompt.txt", "r", encoding="utf-8") as f:
-    system_prompt = f.read()
 
 
 # Build graph function
-def build_graph(provider: str = "google"):
-    """Build the LangGraph for the agent.
-    Args:
-        provider: LLM provider to use ('google' or 'groq')
-    """
-    # Select LLM based on provider
-    if provider == "google":
-        # Google Gemini
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            raise ValueError("GOOGLE_API_KEY environment variable not set")
-        llm = ChatGoogleGenerativeAI(
-            model="gemini-2.0-flash",
-            google_api_key=api_key,
-            temperature=0.1,
-            convert_system_message_to_human=False,
+def build_graph(provider: str = "groq"):
+    """Build the graph"""
+    # Load environment variables from .env file
+    if provider == "groq":
+        # Groq https://console.groq.com/docs/models
+        llm = ChatGroq(model="deepseek-r1-distill-llama-70b", temperature=0)
+    elif provider == "huggingface":
+        # TODO: Add huggingface endpoint
+        llm = ChatHuggingFace(
+            llm=HuggingFaceEndpoint(
+                repo_id="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+                task="text-generation",  # for chat‐style use “text-generation”
+                max_new_tokens=1024,
+                do_sample=False,
+                repetition_penalty=1.03,
+                temperature=0,
+            ),
+            verbose=True,
         )
-    elif provider == "groq":
-        # Groq
-        groq_key = os.getenv("GROQ_API_KEY")
-        if not groq_key:
-            raise ValueError("GROQ_API_KEY environment variable not set")
-        llm = ChatGroq(api_key=groq_key, model="qwen-qwq-32b", temperature=0)
     else:
-        raise ValueError("Invalid provider. Choose 'google' or 'groq'")
-
-    # Bind tools to LLM
+        raise ValueError("Invalid provider. Choose 'groq' or 'huggingface'.")
     llm_with_tools = llm.bind_tools(tools)
 
-    # System message
-    sys_msg = SystemMessage(content=system_prompt)
-
-    # Define nodes
     def assistant(state: MessagesState):
         """Assistant node"""
-        # Make sure system prompt is included
-        messages = state["messages"]
-        if not messages or not any(isinstance(msg, SystemMessage) for msg in messages):
-            messages = [sys_msg] + messages
-
-        return {"messages": [llm_with_tools.invoke(messages)]}
+        return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
     def retriever(state: MessagesState):
-        """Retriever node - only used if vector store is available"""
-        if not has_vector_store:
-            # Skip retrieval if vector store is not available
-            return {"messages": [sys_msg] + state["messages"]}
-
+        """Retriever node"""
         try:
-            similar_question = vector_store.similarity_search(
-                state["messages"][-1].content
-            )
-            if similar_question:
+            import csv
+            import json
+            import ast
+            import numpy as np
+            import os
+            from pathlib import Path
+            from sentence_transformers import SentenceTransformer
+            from sklearn.metrics.pairwise import cosine_similarity
+
+            query_text = state["messages"][0].content
+
+            # Create a direct embedding model with the same dimension (768)
+            model = SentenceTransformer("BAAI/bge-base-en-v1.5")
+            query_embedding = model.encode(query_text, normalize_embeddings=True)
+
+            # Load CSV file with embeddings
+            docs = []
+            with open("supabase_docs.csv", newline="", encoding="utf-8") as csvfile:
+                reader = csv.DictReader(csvfile)
+                for i, row in enumerate(reader):
+                    try:
+                        # Process embedding
+                        embedding_str = row["embedding"]
+                        embedding_str = embedding_str.strip("[]")
+                        embedding_vector = np.array(
+                            [float(x.strip()) for x in embedding_str.split(",")]
+                        )
+
+                        # Process metadata using ast.literal_eval which handles Python dict format
+                        try:
+                            metadata = ast.literal_eval(row["metadata"])
+                        except Exception as json_error:
+                            print(f"Error parsing metadata at row {i}: {json_error}")
+                            metadata = {"source": "unknown"}
+
+                        # Create document object
+                        doc = type(
+                            "Document",
+                            (),
+                            {
+                                "page_content": row["content"],
+                                "metadata": metadata,
+                            },
+                        )
+
+                        # Add to docs list
+                        docs.append((doc, embedding_vector))
+                    except Exception as row_error:
+                        print(f"Error processing row {i}: {row_error}")
+                        continue
+
+            # Calculate similarity
+            similarities = []
+            for doc, doc_embedding in docs:
+                similarity = cosine_similarity([query_embedding], [doc_embedding])[0][0]
+                similarities.append((doc, similarity))
+
+            # Sort by similarity (highest first)
+            similar_questions = [
+                doc for doc, _ in sorted(similarities, key=lambda x: x[1], reverse=True)
+            ]
+
+            if similar_questions and len(similar_questions) > 0:
                 example_msg = HumanMessage(
-                    content=f"Here is a similar question and answer for reference: \n\n{similar_question[0].page_content}",
+                    content=f"Here I provide a similar question and answer for reference: \n\n{similar_questions[0].page_content}",
                 )
                 return {"messages": [sys_msg] + state["messages"] + [example_msg]}
+            else:
+                return {"messages": [sys_msg] + state["messages"]}
         except Exception as e:
-            print(f"Retriever error: {e}")
+            print(f"Error in retriever node: {e}")
+            return {"messages": [sys_msg] + state["messages"]}
 
-        # Default fallback
-        return {"messages": [sys_msg] + state["messages"]}
-
-    # Build graph
     builder = StateGraph(MessagesState)
     builder.add_node("retriever", retriever)
     builder.add_node("assistant", assistant)
     builder.add_node("tools", ToolNode(tools))
-
-    # Add edges
     builder.add_edge(START, "retriever")
     builder.add_edge("retriever", "assistant")
     builder.add_conditional_edges(
@@ -369,111 +822,3 @@ def build_graph(provider: str = "google"):
 
     # Compile graph
     return builder.compile()
-
-
-class GAIAAgent:
-    """GAIA Agent using LangGraph for better control flow"""
-
-    def __init__(self):
-        """Initialize the agent with LangGraph and tools"""
-        print("Initializing GAIA Agent with LangGraph...")
-
-        try:
-            # Create the graph using Google Gemini as default
-            self.graph = build_graph(provider="google")
-            print("GAIA Agent ready.")
-        except Exception as e:
-            print(f"Error initializing GAIA Agent: {e}")
-            # Try fallback to groq if available
-            if os.getenv("GROQ_API_KEY"):
-                print("Trying fallback to Groq...")
-                self.graph = build_graph(provider="groq")
-                print("GAIA Agent ready (using Groq fallback).")
-            else:
-                raise e
-
-    def __call__(self, question: str) -> str:
-        """Process a question and return an answer"""
-        print(f"Agent received question (first 50 chars): {question[:50]}...")
-
-        # Special handling for table questions
-        if "|" in question and "-|" in question:
-            print("Detected table in question")
-            question = (
-                "This question contains a table that defines a mathematical operation. "
-                "Extract and analyze it: " + question
-            )
-
-        # Special handling for reversed text
-        if question.startswith(".") and ("..." in question or question.endswith(".")):
-            print("Detected possible reversed text")
-            reversed_text = reverse_text(question)
-            question = f"This text appears to be reversed. Original: {question} Reversed: {reversed_text}"
-
-        # Create initial message
-        messages = [HumanMessage(content=question)]
-
-        try:
-            # Invoke the graph
-            print("Invoking LangGraph...")
-            result = self.graph.invoke({"messages": messages})
-
-            # Extract content from final message
-            final_message = result["messages"][-1]
-            if hasattr(final_message, "content"):
-                content = final_message.content
-            else:
-                content = str(final_message)
-
-            print("Received response from LangGraph")
-            print(f"Response first 50 chars: {content[:50]}...")
-
-            # Extract the FINAL ANSWER portion
-            pattern = r"FINAL ANSWER:\s*(.*?)(?:\s*$)"
-            match = re.search(pattern, content, re.DOTALL)
-
-            if match:
-                answer = match.group(1).strip()
-                print(f"Extracted final answer: {answer[:50]}...")
-                return answer
-            else:
-                print("No FINAL ANSWER format found, using full response")
-                return content.strip()
-
-        except Exception as e:
-            error_msg = f"Error processing question: {str(e)}"
-            print(error_msg)
-            return error_msg
-
-
-# Test the agent
-if __name__ == "__main__":
-    agent = GAIAAgent()
-
-    # Test with a simple question
-    test_question = "What is 2+2?"
-    print(f"\nTesting with simple question: {test_question}")
-    answer = agent(test_question)
-    print(f"Answer: {answer}")
-    print(f"Answer: {answer}")
-
-    # Test with a table question
-    table_question = """Given this table defining * on the set S = {a, b, c, d, e}
-    |*|a|b|c|d|e|
-    |---|---|---|---|---|---|
-    |a|a|b|c|b|d|
-    |b|b|c|a|e|c|
-    |c|c|a|b|b|a|
-    |d|b|e|b|e|d|
-    |e|d|b|a|d|c|
-    provide the subset of S involved in any possible counter-examples that prove * is not commutative. Provide your answer as a comma separated list of the elements in the set in alphabetical order."""
-
-    print(f"\nTesting with table question")
-    answer = agent(table_question)
-    print(f"Answer: {answer}")
-
-    # Test with reversed text
-    reversed_question = '.rewsna eht sa "tfel" drow eht fo etisoppo eht etirW'
-    print(f"\nTesting with reversed question: {reversed_question}")
-    answer = agent(reversed_question)
-    print(f"Answer: {answer}")
